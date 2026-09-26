@@ -16,5 +16,3 @@ https://github.com/user-attachments/assets/cf0fdf42-6dca-4b3a-831f-82b159b61843
 
 
 
-
-[Leader_Follower_Arm_Code_Document.pdf](https://github.com/user-attachments/files/32682012/Leader_Follower_Arm_Code_Document.pdf)
