@@ -1,0 +1,576 @@
+from machine import Pin, PWM, I2C, SoftI2C
+import time
+import math
+
+
+# ============================================================
+# AS5600 AYARLARI
+# ============================================================
+
+AS5600_ADDRESS = 0x36
+RAW_ANGLE_REGISTER = 0x0C
+
+
+# ============================================================
+# ENCODER HATLARI
+# ============================================================
+
+# Dirsek AS5600: SDA GP14, SCL GP15
+i2c_elbow = SoftI2C(
+    sda=Pin(14),
+    scl=Pin(15),
+    freq=50_000
+)
+
+# Taban AS5600: SDA GP6, SCL GP7
+i2c_base = I2C(
+    1,
+    sda=Pin(6),
+    scl=Pin(7),
+    freq=100_000
+)
+
+# Omuz AS5600: SDA GP4, SCL GP5
+i2c_shoulder = SoftI2C(
+    sda=Pin(2
+            ),
+    scl=Pin(3),
+    freq=100_000
+)
+
+
+# ============================================================
+# SERVO PİNLERİ
+# ============================================================
+
+BASE_SERVO_PIN = 11
+SHOULDER_SERVO_PIN = 12
+ELBOW_SERVO_PIN = 13
+
+
+# ============================================================
+# SERVO PWM AYARLARI
+# ============================================================
+
+JOINT_MIN_US = 500
+JOINT_MAX_US = 2500
+
+BASE_MIN_US = 500
+BASE_MAX_US = 2500
+
+
+# ============================================================
+# SERVO AÇILARI
+# ============================================================
+
+BASE_CENTER = 180
+
+SHOULDER_CENTER = 90
+SHOULDER_MIN = 10
+SHOULDER_MAX = 170
+
+ELBOW_CENTER = 90
+ELBOW_MIN = 10
+ELBOW_MAX = 170
+
+
+# ============================================================
+# HAREKET AYARLARI
+# ============================================================
+
+BASE_STEP = 1.0
+SHOULDER_STEP = 0.7
+ELBOW_STEP = 0.7
+
+LOOP_DELAY_MS = 20
+
+FILTER_ALPHA = 0.20
+DEAD_BAND = 1.0
+
+
+# ============================================================
+# YÖN AYARLARI
+# ============================================================
+
+# Ters hareket eden eklemi -1 yap
+BASE_DIRECTION = -1
+SHOULDER_DIRECTION = 1
+ELBOW_DIRECTION = -1
+
+
+# ============================================================
+# BAŞLANGIÇ DEĞERLERİ
+# ============================================================
+
+current_base_angle = BASE_CENTER
+current_shoulder_angle = SHOULDER_CENTER
+current_elbow_angle = ELBOW_CENTER
+
+filtered_base_relative = 0.0
+filtered_shoulder_relative = 0.0
+filtered_elbow_relative = 0.0
+
+
+# ============================================================
+# GENEL FONKSİYONLAR
+# ============================================================
+
+def constrain(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def map_value(value, in_min, in_max, out_min, out_max):
+    return (
+        (value - in_min)
+        * (out_max - out_min)
+        / (in_max - in_min)
+        + out_min
+    )
+
+
+def microseconds_to_duty(pulse_us):
+    return int(
+        pulse_us / 20_000 * 65_535
+    )
+
+
+def normalize_360(angle):
+    return angle % 360
+
+
+def relative_angle(current_angle, zero_angle):
+    return (
+        current_angle
+        - zero_angle
+        + 180
+    ) % 360 - 180
+
+
+def shortest_angle_difference(target, current):
+    return (
+        target
+        - current
+        + 180
+    ) % 360 - 180
+
+
+def move_towards(current, target, maximum_step):
+    difference = target - current
+
+    if abs(difference) <= maximum_step:
+        return target
+
+    if difference > 0:
+        return current + maximum_step
+
+    return current - maximum_step
+
+
+def move_towards_circular(current, target, maximum_step):
+    difference = shortest_angle_difference(
+        target,
+        current
+    )
+
+    if abs(difference) <= maximum_step:
+        return normalize_360(target)
+
+    if difference > 0:
+        current += maximum_step
+    else:
+        current -= maximum_step
+
+    return normalize_360(current)
+
+
+# ============================================================
+# AS5600 OKUMA
+# ============================================================
+
+def read_as5600_raw(i2c_bus, name, retry_count=5):
+    last_error = None
+
+    for attempt in range(retry_count):
+        try:
+            data = i2c_bus.readfrom_mem(
+                AS5600_ADDRESS,
+                RAW_ANGLE_REGISTER,
+                2
+            )
+
+            raw_angle = (
+                (data[0] << 8)
+                | data[1]
+            ) & 0x0FFF
+
+            return raw_angle
+
+        except OSError as error:
+            last_error = error
+
+            print(
+                name,
+                "okuma hatası:",
+                attempt + 1,
+                "/",
+                retry_count
+            )
+
+            time.sleep_ms(20)
+
+    raise last_error
+
+
+def read_as5600_degrees(i2c_bus, name):
+    raw_angle = read_as5600_raw(
+        i2c_bus,
+        name
+    )
+
+    return raw_angle * 360.0 / 4096.0
+
+
+# ============================================================
+# SERVO KONTROLÜ
+# ============================================================
+
+def set_standard_servo_angle(
+    servo,
+    angle,
+    minimum,
+    maximum
+):
+    angle = constrain(
+        angle,
+        minimum,
+        maximum
+    )
+
+    pulse_us = map_value(
+        angle,
+        0,
+        180,
+        JOINT_MIN_US,
+        JOINT_MAX_US
+    )
+
+    servo.duty_u16(
+        microseconds_to_duty(pulse_us)
+    )
+
+
+def set_base_servo_angle(angle):
+    angle = normalize_360(angle)
+
+    pulse_us = map_value(
+        angle,
+        0,
+        360,
+        BASE_MIN_US,
+        BASE_MAX_US
+    )
+
+    base_servo.duty_u16(
+        microseconds_to_duty(pulse_us)
+    )
+
+
+# ============================================================
+# KALİBRASYON
+# ============================================================
+
+def circular_average(i2c_bus, name, sample_count=30):
+    sum_sin = 0.0
+    sum_cos = 0.0
+    valid_samples = 0
+
+    while valid_samples < sample_count:
+        try:
+            angle = read_as5600_degrees(
+                i2c_bus,
+                name
+            )
+
+            radians = math.radians(angle)
+
+            sum_sin += math.sin(radians)
+            sum_cos += math.cos(radians)
+
+            valid_samples += 1
+
+            time.sleep_ms(15)
+
+        except OSError as error:
+            print(
+                name,
+                "kalibrasyon hatası:",
+                error
+            )
+
+            time.sleep_ms(100)
+
+    average = math.degrees(
+        math.atan2(sum_sin, sum_cos)
+    )
+
+    if average < 0:
+        average += 360
+
+    return average
+
+
+def calibrate_encoders():
+    print()
+    print("Put leader arm at the initial position.")
+    input("Press Enter When Arm Is Ready: ")
+    print()
+
+    base_zero = circular_average(
+        i2c_base,
+        "Base"
+    )
+
+    shoulder_zero = circular_average(
+        i2c_shoulder,
+        "Shoulder"
+    )
+
+    elbow_zero = circular_average(
+        i2c_elbow,
+        "Elbow"
+    )
+
+    print("Calibration is done.")
+    print("Base zero:", round(base_zero, 2))
+    print("Shoulder zero:", round(shoulder_zero, 2))
+    print("Elbow zero:", round(elbow_zero, 2))
+    print()
+
+    return base_zero, shoulder_zero, elbow_zero
+
+
+# ============================================================
+# BAĞLANTI KONTROLÜ
+# ============================================================
+
+def check_encoder(i2c_bus, name):
+    devices = i2c_bus.scan()
+
+    print(
+        name,
+        "I2C devices:",
+        devices
+    )
+
+    if AS5600_ADDRESS not in devices:
+        print(
+            "Error:",
+            name,
+            "AS5600 not found."
+        )
+
+        while True:
+            time.sleep(1)
+
+
+# ============================================================
+# BAŞLANGIÇ
+# ============================================================
+
+print()
+print("Leader-follower system initialize.")
+print()
+
+check_encoder(
+    i2c_base,
+    "Base"
+)
+
+check_encoder(
+    i2c_shoulder,
+    "Shoulder"
+)
+
+check_encoder(
+    i2c_elbow,
+    "Elbow"
+)
+
+base_zero, shoulder_zero, elbow_zero = calibrate_encoders()
+
+# Servolara yalnızca leader başlangıç pozisyonu belirlendikten sonra PWM ver.
+base_servo = PWM(Pin(BASE_SERVO_PIN))
+shoulder_servo = PWM(Pin(SHOULDER_SERVO_PIN))
+elbow_servo = PWM(Pin(ELBOW_SERVO_PIN))
+base_servo.freq(50)
+shoulder_servo.freq(50)
+elbow_servo.freq(50)
+
+set_base_servo_angle(
+    current_base_angle
+)
+
+set_standard_servo_angle(
+    shoulder_servo,
+    current_shoulder_angle,
+    SHOULDER_MIN,
+    SHOULDER_MAX
+)
+
+set_standard_servo_angle(
+    elbow_servo,
+    current_elbow_angle,
+    ELBOW_MIN,
+    ELBOW_MAX
+)
+
+time.sleep(1)
+
+print("System is ready.")
+print()
+
+
+# ============================================================
+# ANA DÖNGÜ
+# ============================================================
+
+while True:
+    try:
+        base_absolute = read_as5600_degrees(
+            i2c_base,
+            "Base"
+        )
+
+        shoulder_absolute = read_as5600_degrees(
+            i2c_shoulder,
+            "Shoulder"
+        )
+
+        elbow_absolute = read_as5600_degrees(
+            i2c_elbow,
+            "Elbow"
+        )
+
+        base_relative = relative_angle(
+            base_absolute,
+            base_zero
+        ) * BASE_DIRECTION
+
+        shoulder_relative = relative_angle(
+            shoulder_absolute,
+            shoulder_zero
+        ) * SHOULDER_DIRECTION
+
+        elbow_relative = relative_angle(
+            elbow_absolute,
+            elbow_zero
+        ) * ELBOW_DIRECTION
+
+        filtered_base_relative = (
+            FILTER_ALPHA * base_relative
+            + (1 - FILTER_ALPHA)
+            * filtered_base_relative
+        )
+
+        filtered_shoulder_relative = (
+            FILTER_ALPHA * shoulder_relative
+            + (1 - FILTER_ALPHA)
+            * filtered_shoulder_relative
+        )
+
+        filtered_elbow_relative = (
+            FILTER_ALPHA * elbow_relative
+            + (1 - FILTER_ALPHA)
+            * filtered_elbow_relative
+        )
+
+        if abs(filtered_base_relative) < DEAD_BAND:
+            filtered_base_relative = 0.0
+
+        if abs(filtered_shoulder_relative) < DEAD_BAND:
+            filtered_shoulder_relative = 0.0
+
+        if abs(filtered_elbow_relative) < DEAD_BAND:
+            filtered_elbow_relative = 0.0
+
+        target_base_angle = normalize_360(
+            BASE_CENTER
+            + filtered_base_relative
+        )
+
+        target_shoulder_angle = constrain(
+            SHOULDER_CENTER
+            + filtered_shoulder_relative,
+            SHOULDER_MIN,
+            SHOULDER_MAX
+        )
+
+        target_elbow_angle = constrain(
+            ELBOW_CENTER
+            + filtered_elbow_relative,
+            ELBOW_MIN,
+            ELBOW_MAX
+        )
+
+        current_base_angle = move_towards_circular(
+            current_base_angle,
+            target_base_angle,
+            BASE_STEP
+        )
+
+        current_shoulder_angle = move_towards(
+            current_shoulder_angle,
+            target_shoulder_angle,
+            SHOULDER_STEP
+        )
+
+        current_elbow_angle = move_towards(
+            current_elbow_angle,
+            target_elbow_angle,
+            ELBOW_STEP
+        )
+
+        set_base_servo_angle(
+            current_base_angle
+        )
+
+        set_standard_servo_angle(
+            shoulder_servo,
+            current_shoulder_angle,
+            SHOULDER_MIN,
+            SHOULDER_MAX
+        )
+
+        set_standard_servo_angle(
+            elbow_servo,
+            current_elbow_angle,
+            ELBOW_MIN,
+            ELBOW_MAX
+        )
+
+        print(
+            "Base L:",
+            round(base_relative, 1),
+            "F:",
+            round(current_base_angle, 1),
+
+            "| Shoulder L:",
+            round(shoulder_relative, 1),
+            "F:",
+            round(current_shoulder_angle, 1),
+
+            "| Elbow L:",
+            round(elbow_relative, 1),
+            "F:",
+            round(current_elbow_angle, 1)
+        )
+
+        time.sleep_ms(LOOP_DELAY_MS)
+
+    except OSError as error:
+        print("I2C read error:", error)
+        time.sleep_ms(100)
+
+    except Exception as error:
+        print("System error:", error)
+        time.sleep_ms(100)
