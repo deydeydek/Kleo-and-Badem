@@ -1,4 +1,4 @@
-# Kleo-and-Badem
+# Kleo and Badem: Leader–Follower Robotic Arms
 Leader follower robotic arm system
 
 https://github.com/user-attachments/assets/693d3f99-14a7-4abe-a41d-2187b9fb3e71
